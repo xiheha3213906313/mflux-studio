@@ -12,6 +12,7 @@ cp "$project_dir/Resources/DownloadPreset.py" "$resources/DownloadPreset.py"
 cp "$project_dir/Resources/zh-Hans.lproj/InfoPlist.strings" "$resources/zh-Hans.lproj/InfoPlist.strings"
 
 xcrun swiftc -O -target arm64-apple-macos14.0 \
+    -module-cache-path "$project_dir/build/.swift-module-cache" \
     "$project_dir/Sources/MFluxStudio.swift" \
     "$project_dir/Sources/StudioModels.swift" \
     "$project_dir/Sources/StudioViews.swift" \
