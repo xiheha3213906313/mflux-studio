@@ -67,29 +67,76 @@ final class FrameServer: ObservableObject {
     private weak var studio: Studio?
     private let root: URL
     private let files = FileManager.default
+    private let preferences: UserDefaults
+    private static let enabledKey = "FrameStudioConnectionEnabled"
+    private static let interfaceKey = "FrameStudioConnectionInterface"
+    private var monitor: Timer?
     private var listener: NWListener?
+    private var boundInterface: FrameAddress?
     private var identity: FrameTLS?
     private var connections: [UUID: FrameHTTPConnection] = [:]
-    private var pairing: (secret: String, expires: Date)?
+    private var pairing: FramePairing?
     private var records: [String: FrameJob] = [:]
     private var activeKey: String?
     private var cancellationPending = false
     private var loaded = false
 
+    @Published private(set) var enabled: Bool
     @Published private(set) var address: String?
     @Published private(set) var starting = false
-    @Published private(set) var pairingText: String?
+    @Published private(set) var pairingCode: String?
     @Published private(set) var pairExpires: Date?
     @Published private(set) var devices: [FrameDevice] = []
     @Published private(set) var jobs: [FrameJob] = []
     @Published private(set) var error: String?
 
-    init(studio: Studio) {
+    init(studio: Studio, preferences: UserDefaults = .standard) {
         self.studio = studio
+        self.preferences = preferences
+        enabled = preferences.bool(forKey: Self.enabledKey)
         root = studio.root.appendingPathComponent(".FrameStudio", isDirectory: true)
     }
 
-    var live: Bool { listener != nil }
+    deinit {
+        monitor?.invalidate()
+        listener?.cancel()
+    }
+
+    var preferredInterface: String? { preferences.string(forKey: Self.interfaceKey) }
+
+    func restorePreference() {
+        guard enabled, monitor == nil else { return }
+        refreshInterface()
+        monitor = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            self?.refreshInterface()
+        }
+    }
+
+    func setEnabled(_ value: Bool, interface: FrameAddress?) {
+        guard enabled != value else { return }
+        if value {
+            preferences.set(interface?.interfaceName, forKey: Self.interfaceKey)
+        }
+        preferences.set(value, forKey: Self.enabledKey)
+        enabled = value
+        if value {
+            restorePreference()
+        } else {
+            monitor?.invalidate()
+            monitor = nil
+            stop()
+            error = nil
+        }
+    }
+
+    private func refreshInterface() {
+        let addresses = FrameAddress.available()
+        let selected = preferredInterface == nil ? addresses.first
+            : addresses.first { $0.interfaceName == preferredInterface }
+        guard selected != boundInterface || listener == nil else { return }
+        if listener != nil { stop() }
+        if let selected { start(on: selected) }
+    }
     private var jobRoot: URL { root.appendingPathComponent("jobs", isDirectory: true) }
     private var deviceFile: URL { root.appendingPathComponent("devices.json") }
 
@@ -101,7 +148,12 @@ final class FrameServer: ObservableObject {
             let parameters = try identity.parameters()
             parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(interface.ip), port: port)
             let listener = try NWListener(using: parameters)
+            if interface.interfaceName != "lo0" {
+                let record = NWTXTRecord(["v": "1", "ipv4": interface.id, "serverId": identity.serverId.uuidString])
+                listener.service = NWListener.Service(name: nil, type: "_mflux-studio._tcp", txtRecord: record)
+            }
             self.listener = listener
+            boundInterface = interface
             self.identity = identity
             error = nil
             starting = true
@@ -134,6 +186,7 @@ final class FrameServer: ObservableObject {
     func stop() {
         let current = listener
         listener = nil
+        boundInterface = nil
         current?.cancel()
         let activeConnections = Array(connections.values)
         for connection in activeConnections { connection.close() }
@@ -143,33 +196,22 @@ final class FrameServer: ObservableObject {
     }
 
     func newPairing() {
-        guard let identity, let address else { return }
+        guard address != nil else { return }
         do {
-            let value = try frameSecret()
-            let expires = Date().addingTimeInterval(300)
-            var uri = URLComponents()
-            uri.scheme = "mflux-studio"
-            uri.host = "pair"
-            uri.queryItems = [
-                URLQueryItem(name: "v", value: "1"),
-                URLQueryItem(name: "endpoint", value: address),
-                URLQueryItem(name: "fingerprint", value: identity.fingerprint),
-                URLQueryItem(name: "serverId", value: identity.serverId.uuidString),
-                URLQueryItem(name: "code", value: value)
-            ]
-            pairing = (value, expires)
-            pairingText = uri.string
-            pairExpires = expires
+            let session = try FramePairing()
+            pairing = session
+            pairingCode = session.displayCode
+            pairExpires = session.expires
             error = nil
-            DispatchQueue.main.asyncAfter(deadline: .now() + 300) { [weak self] in
-                if self?.pairing?.secret == value { self?.clearPairing() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + FramePairing.lifetime) { [weak self] in
+                if self?.pairing?.expires == session.expires { self?.clearPairing() }
             }
         } catch { self.error = error.localizedDescription }
     }
 
     private func clearPairing() {
         pairing = nil
-        pairingText = nil
+        pairingCode = nil
         pairExpires = nil
     }
 
@@ -273,7 +315,7 @@ final class FrameServer: ObservableObject {
     }
 
     private func allow(_ head: FrameHTTPHead) throws {
-        let pairing = head.method == "POST" && head.path == "/v1/pair"
+        let pairing = head.method == "POST" && ["/v1/pair/challenge", "/v1/pair"].contains(head.path)
         if !pairing { _ = try authenticate(head) }
         let submit = head.method == "POST" && head.path == "/v1/jobs"
         let limit = submit ? 64 * 1024 * 1024 : pairing ? 2048 : 0
@@ -297,6 +339,7 @@ final class FrameServer: ObservableObject {
     }
 
     private func respond(_ head: FrameHTTPHead, body: Data) throws -> FrameHTTPResponse {
+        if head.method == "POST" && head.path == "/v1/pair/challenge" { return try pairingChallenge(body) }
         if head.method == "POST" && head.path == "/v1/pair" { return try pair(body) }
         let device = try authenticate(head)
         if head.method == "GET" && head.path == "/v1/models", let studio, let identity {
@@ -334,15 +377,28 @@ final class FrameServer: ObservableObject {
         }
     }
 
+    private var invalidPairing: FrameAPIError {
+        FrameAPIError(403, "pairing_invalid", "配对码不正确或已过期。")
+    }
+
+    private func pairingChallenge(_ body: Data) throws -> FrameHTTPResponse {
+        struct Challenge: Decodable { let nonce: String }
+        guard let identity, let pairing, pairing.expires > Date(),
+              let request = try? JSONDecoder().decode(Challenge.self, from: body),
+              FramePairing.validHex(request.nonce) else { throw invalidPairing }
+        return .json(["version": 1, "serverId": identity.serverId.uuidString,
+                      "proof": pairing.proof(.server, nonce: request.nonce, identity: identity)])
+    }
+
     private func pair(_ body: Data) throws -> FrameHTTPResponse {
         struct PairingRequest: Decodable {
-            let code: String
+            let nonce: String
+            let proof: String
             let deviceName: String
         }
         guard let identity, let entry = try? JSONDecoder().decode(PairingRequest.self, from: body),
-              let pairing, pairing.expires > Date(), entry.code == pairing.secret else {
-            throw FrameAPIError(403, "pairing_invalid", "配对信息不正确或已过期。")
-        }
+              let pairing, pairing.expires > Date(), FramePairing.validHex(entry.nonce),
+              pairing.authorizes(entry.proof, nonce: entry.nonce, identity: identity) else { throw invalidPairing }
         let name = entry.deviceName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty, name.count <= 60, !name.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
             throw FrameAPIError(422, "device_name", "请填写 1 到 60 字的设备名称。")

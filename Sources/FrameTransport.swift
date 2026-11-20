@@ -199,6 +199,7 @@ final class FrameHTTPConnection {
 }
 
 struct FrameAddress: Identifiable, Hashable {
+    let interfaceName: String
     let ip: IPv4Address
     let mask: IPv4Address
     var id: String { ip.debugDescription }
@@ -222,7 +223,7 @@ struct FrameAddress: Identifiable, Hashable {
             guard item.ifa_flags & UInt32(IFF_UP | IFF_LOOPBACK) == UInt32(IFF_UP),
                   String(cString: item.ifa_name).hasPrefix("en"),
                   let host = address(item.ifa_addr), isPrivate(host), let netmask = address(item.ifa_netmask) else { continue }
-            addresses.append(Self(ip: host, mask: netmask))
+            addresses.append(Self(interfaceName: String(cString: item.ifa_name), ip: host, mask: netmask))
         }
         return addresses
     }
@@ -296,12 +297,52 @@ func frameDigest(_ data: Data) -> String {
     SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
 }
 
-func frameSecret() throws -> String {
-    var bytes = [UInt8](repeating: 0, count: 32)
+struct FramePairing {
+    static let lifetime: TimeInterval = 300
+    private static let alphabet = Array("0123456789ABCDEFGHJKMNPQRSTVWXYZ".utf8)
+
+    let code: String
+    let expires: Date
+
+    init() throws {
+        code = try frameRandomBytes(count: 12).map { byte in
+            Self.alphabet[Int(byte & 31)]
+        }.withUnsafeBufferPointer { String(decoding: $0, as: UTF8.self) }
+        expires = Date().addingTimeInterval(Self.lifetime)
+    }
+
+    var displayCode: String { "\(code.prefix(4))-\(code.dropFirst(4).prefix(4))-\(code.suffix(4))" }
+
+    static func validHex(_ value: String) -> Bool {
+        value.utf8.count == 64 && value.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
+    }
+
+    enum Role: String { case server, client }
+
+    func proof(_ role: Role, nonce: String, identity: FrameTLS) -> String {
+        let input = ["mflux-studio-pair-v1:" + role.rawValue, identity.serverId.uuidString.lowercased(),
+                     identity.fingerprint, nonce].joined(separator: "\n")
+        let mac = HMAC<SHA256>.authenticationCode(for: Data(input.utf8), using: SymmetricKey(data: Data(code.utf8)))
+        return mac.map { String(format: "%02x", $0) }.joined()
+    }
+
+    func authorizes(_ proof: String, nonce: String, identity: FrameTLS) -> Bool {
+        guard Self.validHex(proof) else { return false }
+        let expected = self.proof(.client, nonce: nonce, identity: identity)
+        return zip(expected.utf8, proof.utf8).reduce(UInt8(0)) { $0 | ($1.0 ^ $1.1) } == 0
+    }
+}
+
+private func frameRandomBytes(count: Int) throws -> [UInt8] {
+    var bytes = [UInt8](repeating: 0, count: count)
     guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
         throw StudioError("无法生成配对凭证。")
     }
-    return Data(bytes).base64EncodedString().replacingOccurrences(of: "+", with: "-")
+    return bytes
+}
+
+func frameSecret() throws -> String {
+    try Data(frameRandomBytes(count: 32)).base64EncodedString().replacingOccurrences(of: "+", with: "-")
         .replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
 }
 

@@ -20,37 +20,44 @@ struct FramePanel: View {
                             if form.interfaces.isEmpty { Text("未找到 IPv4 地址").tag(nil as FrameAddress?) }
                             ForEach(form.interfaces) { address in Text(address.id).tag(Optional(address)) }
                         }
-                        .disabled(server.live || form.interfaces.isEmpty)
-                        if server.live {
-                            Button("关闭连接") { server.stop() }
-                        } else {
-                            Button("开启连接") { if let selection = form.selection { server.start(on: selection) } }
-                                .buttonStyle(.borderedProminent).disabled(form.selection == nil)
-                        }
+                        .disabled(server.enabled || form.interfaces.isEmpty)
+                        Spacer(minLength: 8)
+                        Toggle("开启连接", isOn: Binding(
+                            get: { server.enabled },
+                            set: { server.setEnabled($0, interface: form.selection) }
+                        ))
+                        .toggleStyle(.switch)
                     }
+                    Text("开启后，每次打开 MFlux Studio 时会自动启动服务。")
+                        .font(.callout).foregroundStyle(.secondary)
                     if let address = server.address {
                         LabeledContent("服务地址") {
                             Text(address).monospaced().textSelection(.enabled)
                         }
-                        HStack {
-                            Button("生成配对信息") { form.copied = false; server.newPairing() }
-                            if let pairing = server.pairingText {
-                                Button(form.copied ? "已复制" : "复制配对信息") {
-                                    NSPasteboard.general.clearContents()
-                                    NSPasteboard.general.setString(pairing, forType: .string)
-                                    form.copied = true
-                                }
+                        if let code = server.pairingCode, let expires = server.pairExpires {
+                            LabeledContent("配对码") {
+                                Text(code)
+                                    .font(.system(.title3, design: .monospaced).weight(.semibold))
+                                    .textSelection(.enabled)
+                                    .accessibilityLabel(Text("配对码 \(code)"))
                             }
-                        }
-                        if let expires = server.pairExpires {
-                            Text("在映序的连接设置中粘贴配对信息。\(expires.formatted(date: .omitted, time: .shortened)) 前可使用一次。")
-                                .font(.callout).foregroundStyle(.secondary)
+                            HStack {
+                                Text("在安卓映序选择这台 Mac，输入配对码。")
+                                    .font(.callout).foregroundStyle(.secondary)
+                                Spacer()
+                                Button("重新生成") { server.newPairing() }
+                            }
+                            Text("此码在 \(expires.formatted(date: .omitted, time: .shortened)) 前可使用一次。")
+                                .font(.caption).foregroundStyle(.secondary)
+                        } else {
+                            Button("生成配对码") { server.newPairing() }
                         }
                     } else if server.starting {
                         ProgressView("正在启动局域网连接…").controlSize(.small)
-                    } else {
-                        Text("开启后，已配对的安卓设备可使用此 Mac 的本地模型。")
+                    } else if server.enabled {
+                        Text("等待所选网络可用，连接恢复后会自动启动。")
                             .font(.callout).foregroundStyle(.secondary)
+                    } else {
                         Button("刷新局域网地址") { reloadInterfaces() }
                     }
                 }
@@ -96,12 +103,13 @@ struct FramePanel: View {
         .padding(20)
         .frame(width: 530)
         .onAppear { reloadInterfaces() }
+        .onChange(of: server.address) { _, _ in reloadInterfaces() }
     }
 
     private func reloadInterfaces() {
         form.interfaces = FrameAddress.available()
         if let selection = form.selection, form.interfaces.contains(selection) { return }
-        form.selection = form.interfaces.first
+        form.selection = form.interfaces.first { $0.interfaceName == server.preferredInterface } ?? form.interfaces.first
     }
 }
 
@@ -109,5 +117,4 @@ struct FramePanel: View {
 private final class FramePanelForm: ObservableObject {
     @Published var interfaces: [FrameAddress] = []
     @Published var selection: FrameAddress?
-    @Published var copied = false
 }

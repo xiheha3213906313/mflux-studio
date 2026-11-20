@@ -2,11 +2,28 @@
 
 ## 启动和配对
 
-在 MFlux Studio 的「连接映序」中手动开启服务。服务绑定选定的局域网 IPv4 地址和 TCP 42817，只接受同 IPv4 子网的请求。Mac 应用保持运行。手机与 Mac 无需互联网连接即可使用已安装的模型。
+在 MFlux Studio 的「连接映序」打开「开启连接」开关。应用保存开关和选定网卡，之后每次打开 MFlux Studio 都会自动恢复。服务绑定该网卡的局域网 IPv4 地址和 TCP 42817，接收同 IPv4 子网的请求。服务默认关闭。手机启动时可用已保存的凭证重连 Mac。
 
-每次生成的配对文本形如 `mflux-studio://pair?v=1&endpoint=…&fingerprint=…&serverId=…&code=…`。用 URI 解析器读取参数，并检查版本、HTTPS 地址、Mac 的 UUID 和 64 位十六进制指纹。指纹是 Mac 自签名叶证书 DER 字节的 SHA-256。TLS 1.2 或以上。首次发送任何信息前，用从 Mac 界面复制的指纹核验 TLS 叶证书。此身份校验仅用于与该 Mac 配对的原生网络连接。地址变化时可修改端点，继续验证同一证书指纹和 serverId。
+Mac 用 Bonjour 发布 `_mflux-studio._tcp`，TXT 含 `v=1`、`ipv4` 和 `serverId`。Android 使用 NSD 找到设备，让用户选择 Mac 后输入配对码。发现失败时支持手动填入 Mac 显示的 HTTPS 地址。Bonjour 和手填地址都只提供连接地址，身份要在 TLS 中核验。
 
-`POST /v1/pair` 接受 JSON 请求 `{"code":"…","deviceName":"我的手机"}`。返回 HTTP 201 和 `{"version":1,"serverId":"…","deviceId":"…","token":"…"}`。配对码有效期为五分钟，用后失效。确认返回的 serverId 和配对文本一致，保存 serverId、deviceId 和 endpoint，并加密保存 token。之后的请求发送 `Authorization: Bearer <token>`。被撤销的设备收到 401。配对地址和已配对设备的凭证与方舟连接各自管理。
+### 一次性配对码
+
+从 MFlux Studio 1.17 开始使用配对码。Mac 界面显示 12 位字符，形如 `XXXX-XXXX-XXXX`。输入可忽略连字符、空格和大小写，规范化后必须是 12 个来自 `0123456789ABCDEFGHJKMNPQRSTVWXYZ` 的字符。五分钟内可使用一次。重新生成、停止服务或成功配对会让当前码失效。配对码留在手机本地用于计算证明。
+
+1. 生成 32 字节的客户端随机数，编码为 64 位小写十六进制字符串 `nonce`。在独立、临时的 TLS 1.2+ 连接中记录实际叶证书的 DER SHA-256 指纹。配对前的自签名只用于这条受限连接。发送 `POST /v1/pair/challenge` 和 `{"nonce":"…"}`，获得 `{"version":1,"serverId":"…","proof":"…"}`。这一步只发送随机数。
+2. 用下面的算法计算 `server` 证明并与响应做常量时间比较。指纹必须来自 TLS 握手。校验通过后，把该证书指纹固定给此 Mac。在发送最终配对请求前，后续 TLS 握手继续校验该指纹。
+3. 用同一个 nonce 和 `client` 角色计算另一个证明，发送 `POST /v1/pair` 和 `{"nonce":"…","proof":"…","deviceName":"我的手机"}`。返回 201 和 `{"version":1,"serverId":"…","deviceId":"…","token":"…"}`。校验两次返回的 serverId 一致。保存配对证书指纹、serverId、deviceId 和 endpoint，并加密保存 token。403 `pairing_invalid` 表示证明无效、码已使用或已过期。
+
+证明为 `hexLower(HMAC-SHA256(key=UTF8(规范化后的配对码), message=UTF8(下列四行)))`。行与行之间使用 LF，末尾不加换行。serverId 用小写 UUID，指纹和 nonce 都用小写十六进制。
+
+```text
+mflux-studio-pair-v1:<server 或 client>
+<serverId>
+<实际 TLS 叶证书 DER 的 SHA-256>
+<nonce>
+```
+
+已配对的请求发送 `Authorization: Bearer <token>`，并在发送前核验保存的证书指纹。地址变化时可重新发现或手动更新地址，确认同一证书和 serverId 后继续使用原凭证与任务 ID。被撤销的设备收到 401。配对凭证与方舟连接各自管理。
 
 HTTP 使用 1.1、固定 `Content-Length`、无重定向。含 JSON 的 POST 用 `Content-Type: application/json`，取消请求为空体。每次请求后服务端关闭连接。错误返回 `{"error":{"code":"…","message":"…"}}`，业务判断用 HTTP 状态与 code。
 
