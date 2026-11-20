@@ -189,7 +189,7 @@ final class FrameServer: ObservableObject {
         boundInterface = nil
         current?.cancel()
         let activeConnections = Array(connections.values)
-        for connection in activeConnections { connection.close() }
+        for connection in activeConnections { connection.close(reason: "service_stop") }
         address = nil
         starting = false
         clearPairing()
@@ -365,13 +365,11 @@ final class FrameServer: ObservableObject {
             return .json(response, status: response["cancelRequested"] != nil ? 202 : 200)
         case ("GET", "output"):
             guard job.state == .succeeded else { throw FrameAPIError(409, "output_not_ready", "任务尚无可下载原图。") }
-            let file = outputFile(directory(job.key))
-            guard let finished = job.finished, Date().timeIntervalSince(finished) <= 7 * 86400,
-                  let values = try? file.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey]),
-                  values.isRegularFile == true, let size = values.fileSize, size > 0 else {
-                throw FrameAPIError(404, "output_unavailable", "Mac 上的原图已不可用。")
+            guard let finished = job.finished, Date().timeIntervalSince(finished) <= 7 * 86400 else {
+                throw FrameDownload.unavailable(job.id, reason: "expired")
             }
-            return FrameHTTPResponse(status: 200, type: "image/png", body: .file(file, size))
+            let output = try FrameDownload.open(outputFile(directory(job.key)), jobId: job.id)
+            return FrameHTTPResponse(status: 200, type: "image/png", body: .file(output))
         default:
             throw FrameAPIError(404, "not_found", "此接口不可用。")
         }

@@ -2,6 +2,7 @@ import CryptoKit
 import Darwin
 import Foundation
 import Network
+import OSLog
 import Security
 
 struct FrameAPIError: Error, LocalizedError {
@@ -51,14 +52,47 @@ struct FrameHTTPHead {
     }
 }
 
+struct FrameDownload {
+    static let log = Logger(subsystem: "local.codex.mflux-studio", category: "FrameDownload")
+
+    let jobId: UUID
+    let file: FileHandle
+    let length: Int
+
+    static func open(_ url: URL, jobId: UUID) throws -> Self {
+        let descriptor = Darwin.open(url.path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
+        guard descriptor >= 0 else {
+            let code = errno
+            throw unavailable(jobId, reason: "file_open_error", code: code)
+        }
+        let file = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        var metadata = stat()
+        guard fstat(descriptor, &metadata) == 0 else {
+            let code = errno
+            try? file.close()
+            throw unavailable(jobId, reason: "file_stat_error", code: code)
+        }
+        guard metadata.st_mode & S_IFMT == S_IFREG, let length = Int(exactly: metadata.st_size), length > 0 else {
+            try? file.close()
+            throw unavailable(jobId, reason: "invalid_file")
+        }
+        return Self(jobId: jobId, file: file, length: length)
+    }
+
+    static func unavailable(_ jobId: UUID, reason: String, code: Int32 = 0) -> FrameAPIError {
+        log.notice("job=\(jobId.uuidString, privacy: .public) status=404 reason=\(reason, privacy: .public) errno=\(code)")
+        return FrameAPIError(404, "output_unavailable", "Mac 上的原图已不可用。")
+    }
+}
+
 enum FrameResponseBody {
     case data(Data)
-    case file(URL, Int)
+    case file(FrameDownload)
 
     var length: Int {
         switch self {
         case .data(let data): data.count
-        case .file(_, let size): size
+        case .file(let download): download.length
         }
     }
 }
@@ -89,6 +123,15 @@ struct FrameHTTPResponse {
 }
 
 final class FrameHTTPConnection {
+    private struct DownloadProgress {
+        let output: FrameDownload
+        let started = ProcessInfo.processInfo.systemUptime
+        var read = 0
+        var submitted = 0
+        var processed = 0
+        var finalized = false
+    }
+
     private let connection: NWConnection
     private let allow: (FrameHTTPHead) throws -> Void
     private let respond: (FrameHTTPHead, Data) throws -> FrameHTTPResponse
@@ -97,6 +140,7 @@ final class FrameHTTPConnection {
     private var headerBuffer = Data()
     private var body = Data()
     private var request: FrameHTTPHead?
+    private var download: DownloadProgress?
 
     init(_ connection: NWConnection, allow: @escaping (FrameHTTPHead) throws -> Void,
          respond: @escaping (FrameHTTPHead, Data) throws -> FrameHTTPResponse, closed: @escaping () -> Void) {
@@ -110,17 +154,29 @@ final class FrameHTTPConnection {
         connection.stateUpdateHandler = { [weak self] state in
             switch state {
             case .ready: self?.read()
-            case .failed, .cancelled: self?.close()
+            case .failed(let error): self?.close(reason: "connection_failed", error: error)
+            case .cancelled: self?.close(reason: "connection_cancelled")
             default: break
             }
         }
         connection.start(queue: .main)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 120) { [weak self] in self?.close() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 120) { [weak self] in
+            self?.close(reason: "timeout_120s")
+        }
     }
 
-    func close() {
+    func close(reason: String, error: Error? = nil) {
         guard !socketClosed else { return }
         socketClosed = true
+        if let download {
+            if !download.finalized { try? download.output.file.close() }
+            let nsError = error as NSError?
+            let elapsedMs = Int((ProcessInfo.processInfo.systemUptime - download.started) * 1000)
+            FrameDownload.log.notice(
+                "job=\(download.output.jobId.uuidString, privacy: .public) declared=\(download.output.length) read=\(download.read) submitted=\(download.submitted) processed=\(download.processed) final=\(download.finalized) elapsed_ms=\(elapsedMs) reason=\(reason, privacy: .public) error_domain=\(nsError?.domain ?? "-", privacy: .public) error_code=\(nsError?.code ?? 0)"
+            )
+            self.download = nil
+        }
         connection.cancel()
         closed()
     }
@@ -130,7 +186,9 @@ final class FrameHTTPConnection {
             guard let self, !self.socketClosed else { return }
             do {
                 if let data, !data.isEmpty, try self.consume(data) { return }
-                if complete || error != nil { self.close() } else { self.read() }
+                if complete || error != nil {
+                    self.close(reason: "request_ended", error: error)
+                } else { self.read() }
             } catch let error as FrameAPIError {
                 self.send(.failure(error))
             } catch {
@@ -169,33 +227,70 @@ final class FrameHTTPConnection {
     }
 
     private func send(_ response: FrameHTTPResponse) {
+        if case .file(let output) = response.body {
+            download = DownloadProgress(output: output)
+        }
         connection.send(content: response.header, completion: .contentProcessed { [weak self] error in
             guard let self, !self.socketClosed else { return }
-            guard error == nil else { self.close(); return }
+            if let error { self.close(reason: "header_send_error", error: error); return }
             switch response.body {
             case .data(let data):
                 self.connection.send(content: data, isComplete: true,
-                    completion: .contentProcessed { [weak self] _ in self?.close() })
-            case .file(let url, let length):
-                guard let file = try? FileHandle(forReadingFrom: url) else { self.close(); return }
-                self.sendFile(file, remaining: length)
+                    completion: .contentProcessed { [weak self] error in
+                        self?.close(reason: "response_processed", error: error)
+                    })
+            case .file:
+                self.sendFile()
             }
         })
     }
 
-    private func sendFile(_ file: FileHandle, remaining: Int) {
-        guard !socketClosed, remaining > 0, let data = try? file.read(upToCount: min(256 * 1024, remaining)),
-              !data.isEmpty else { try? file.close(); close(); return }
-        connection.send(content: data, isComplete: remaining == data.count,
+    private func sendFile() {
+        guard let download, !socketClosed else { return }
+        let remaining = download.output.length - download.read
+        let data: Data
+        do {
+            guard let chunk = try download.output.file.read(upToCount: min(256 * 1024, remaining)),
+                  !chunk.isEmpty else {
+                close(reason: "file_eof")
+                return
+            }
+            data = chunk
+        } catch {
+            close(reason: "file_read_error", error: error)
+            return
+        }
+        self.download?.read += data.count
+        self.download?.submitted += data.count
+        let final = data.count == remaining
+        connection.send(content: data, contentContext: .finalMessage, isComplete: final,
                         completion: .contentProcessed { [weak self] error in
-            if let self, error == nil, remaining > data.count {
-                self.sendFile(file, remaining: remaining - data.count)
+            guard let self, !self.socketClosed else { return }
+            if let error { self.close(reason: "body_send_error", error: error); return }
+            self.download?.processed += data.count
+            if final {
+                self.download?.finalized = true
+                try? self.download?.output.file.close()
+                // The final context sends a write-close. Processing its last chunk does not imply
+                // delivery to the peer, so leave the connection alive until the peer closes or it times out.
+                self.waitForPeerAfterDownload()
             } else {
-                try? file.close()
-                self?.close()
+                self.sendFile()
             }
         })
     }
+
+    private func waitForPeerAfterDownload() {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [weak self] _, _, complete, error in
+            guard let self, !self.socketClosed else { return }
+            if complete || error != nil {
+                self.close(reason: "peer_ended_after_final", error: error)
+            } else {
+                self.waitForPeerAfterDownload()
+            }
+        }
+    }
+
 }
 
 struct FrameAddress: Identifiable, Hashable {
