@@ -17,6 +17,10 @@ xcrun swiftc -O -target arm64-apple-macos14.0 \
     "$project_dir/Sources/StudioModels.swift" \
     "$project_dir/Sources/StudioViews.swift" \
     "$project_dir/Sources/StudioImaging.swift" \
+    "$project_dir/Sources/FrameInference.swift" \
+    "$project_dir/Sources/FrameTransport.swift" \
+    "$project_dir/Sources/FrameServer.swift" \
+    "$project_dir/Sources/FramePanel.swift" \
     -o "$contents/MacOS/MFluxStudio"
 codesign --force --sign - "$app"
 printf '%s\n' "$app"

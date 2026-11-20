@@ -161,6 +161,9 @@ struct Family: Identifiable {
         }
     }
 
+    var minimumSteps: Int { group == .qwen21 ? 2 : 1 }
+    var isQwen21Turbo: Bool { id == "qwen-image-2.1-turbo" }
+
     var guidanceDefault: Double? {
         switch group {
         case .flux2Small, .flux2Large: id.contains("-base-") ? 1 : nil
@@ -169,20 +172,21 @@ struct Family: Identifiable {
         case .fill: 30
         case .zImage: id == "z-image" ? 4 : nil
         case .qwen: 3.5
-        case .qwen21, .krea2: 1
+        case .qwen21: isQwen21Turbo ? nil : 1
+        case .krea2: 1
         case .anima: id == "anima-turbo" ? 1 : 4
         case .seedvr2: nil
         }
     }
 
     var acceptsNegativePrompt: Bool {
-        [.qwen, .qwen21, .krea2, .anima].contains(group) || id == "z-image"
+        ([.qwen, .qwen21, .krea2, .anima].contains(group) && !isQwen21Turbo) || id == "z-image"
     }
 
     func samplers(referenced: Bool) -> [Sampler] {
         switch group {
         case .krea2, .anima: [.linearEuler, .erSDE]
-        case .qwen21: referenced ? [] : [.linear, .flowMatch]
+        case .qwen21: referenced || isQwen21Turbo ? [] : [.linear, .flowMatch]
         case .flux1, .fill, .qwen, .zImage: [.linear, .flowMatch]
         default: []
         }
@@ -193,7 +197,7 @@ struct Family: Identifiable {
         case .flux2Small, .flux2Large: "Flow Match Euler"
         case .flux3: "Flow Map"
         case .seedvr2: "SeedVR2 Euler"
-        case .qwen21: referenced ? "Linear Euler" : "模型默认"
+        case .qwen21: isQwen21Turbo ? "Qwen-Image 2.1 Turbo" : referenced ? "Linear Euler" : "模型默认"
         default: "模型默认"
         }
     }

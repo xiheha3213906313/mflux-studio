@@ -82,6 +82,7 @@ private struct PresetDownload: Codable {
 }
 
 final class Studio: ObservableObject {
+    lazy var frameServer = FrameServer(studio: self)
     @Published var models: [LocalModel] = []
     @Published var selection: UUID?
     static let customSize = "自定义"
@@ -196,6 +197,8 @@ final class Studio: ObservableObject {
             if fm.fileExists(atPath: path.path) {
                 models = [LocalModel(name: "FLUX.2 Klein 4B · Q4", familyID: "flux2-klein-4b", path: path.path,
                                      presetRepo: Family.find("flux2-klein-4b")?.presetRepo)]
+                do { try save(models) }
+                catch { self.error = "无法保存默认模型清单。\n\(error.localizedDescription)" }
             }
         }
         selection = generationModel?.id ?? models.first?.id
@@ -405,7 +408,7 @@ final class Studio: ObservableObject {
         }
     }
 
-    private func rewriteImageTokens(_ text: String, replacement: (Int) -> String) -> String {
+    func rewriteImageTokens(_ text: String, replacement: (Int) -> String) -> String {
         let pattern = try! NSRegularExpression(pattern: #"@image ([1-9][0-9]*)\b"#)
         var result = text
         for match in pattern.matches(in: text, range: NSRange(text.startIndex..., in: text)).reversed() {
@@ -762,11 +765,19 @@ final class Studio: ObservableObject {
         return CGSize(width: resolution.width, height: resolution.height)
     }
 
-    private func generationOptions(_ family: Family, referenced: Bool, size: CGSize, seed: String) throws -> [String] {
-        guard (1...150).contains(steps) else { throw StudioError("步数应在 1 到 150 之间。") }
+    private var inference: InferenceOptions {
+        InferenceOptions(steps: steps, guidance: guidance, sampler: sampler,
+                         negativePrompt: negativePrompt, lowRAM: lowRAM, adapters: adapters)
+    }
+
+    private func generationOptions(_ family: Family, referenced: Bool, size: CGSize, seed: String,
+                                   settings: InferenceOptions) throws -> [String] {
+        guard (family.minimumSteps...150).contains(settings.steps) else {
+            throw StudioError("步数应在 \(family.minimumSteps) 到 150 之间。")
+        }
         var args = ["--width", String(Int(size.width)), "--height", String(Int(size.height)),
-                    "--steps", String(steps), "--seed", seed]
-        let cfg = guidance.trimmingCharacters(in: .whitespacesAndNewlines)
+                    "--steps", String(settings.steps), "--seed", seed]
+        let cfg = settings.guidance.trimmingCharacters(in: .whitespacesAndNewlines)
         if family.guidanceDefault != nil && !cfg.isEmpty {
             let separator = Locale.current.decimalSeparator ?? "."
             let minimum = family.group == .qwen21 ? 1.0 : 0.0
@@ -776,11 +787,11 @@ final class Studio: ObservableObject {
             }
             args += ["--guidance", String(value)]
         }
-        if family.samplers(referenced: referenced).contains(sampler) { args += ["--scheduler", sampler.rawValue] }
-        let negative = negativePrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if family.samplers(referenced: referenced).contains(settings.sampler) { args += ["--scheduler", settings.sampler.rawValue] }
+        let negative = settings.negativePrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         if family.acceptsNegativePrompt && !negative.isEmpty { args += ["--negative-prompt=\(negative)"] }
-        if lowRAM { args.append("--low-ram") }
-        for adapter in adapters {
+        if settings.lowRAM { args.append("--low-ram") }
+        for adapter in settings.adapters {
             guard fm.isReadableFile(atPath: adapter.url.path) else {
                 throw StudioError("找不到 LoRA 文件 \(adapter.url.lastPathComponent)。")
             }
@@ -791,6 +802,14 @@ final class Studio: ObservableObject {
 
     private func generate(model: LocalModel, family: Family, seed: String, output: URL) throws {
         let input = family.canReference ? references : []
+        let target = try dimensions(input.isEmpty ? size : editSize, reference: input.first, family: family)
+        try generate(model: model, family: family, seed: seed, output: output, input: input,
+                     prompt: prompt, target: target, strength: imageStrength, settings: inference)
+    }
+
+    func generate(model: LocalModel, family: Family, seed: String, output: URL,
+                          input: [ReferenceImage], prompt: String, target: CGSize, strength: Double,
+                          settings: InferenceOptions, completion: InferenceCompletion? = nil) throws {
         if let limit = family.referenceLimit, input.count > limit {
             throw StudioError("当前模型最多支持 \(limit) 张参考图。请先移除多余图片。")
         }
@@ -806,23 +825,20 @@ final class Studio: ObservableObject {
         guard !text.isEmpty else { throw StudioError("请输入提示词。") }
 
         let referenced = !input.isEmpty
-        let target = try dimensions(referenced ? editSize : size, reference: input.first, family: family)
-        var options = try generationOptions(family, referenced: referenced, size: target, seed: seed)
+        var options = try generationOptions(family, referenced: referenced, size: target, seed: seed, settings: settings)
         if let first = input.first {
             options += family.usesInitImage
-                ? ["--image", first.url.path, String(imageStrength)]
+                ? ["--image", first.url.path, String(strength)]
                 : ["--image-paths"] + input.map { $0.url.path }
         }
         let command = (referenced ? family.editCommand : nil) ?? family.command
-        run(command: command, model: model, output: output, activity: referenced ? "正在根据参考图生图…" : "正在生成图片…") { path, _ in
+        run(command: command, model: model, output: output, activity: referenced ? "正在根据参考图生图…" : "正在生成图片…",
+            completion: completion) { path, _ in
             ["--model", path.path, "--base-model", family.id, "--prompt=\(text)", "--output", output.path] + options
         }
     }
 
     private func upscale(input: URL, model: LocalModel, family: Family, seed: String, output: URL) throws {
-        guard fm.isReadableFile(atPath: input.path) else {
-            throw StudioError("请选择需要放大的图片。")
-        }
         let resolution: String
         if upscaleScale == Self.customSize {
             guard upscalePixels > 0 else { throw StudioError("目标短边请填写大于 0 的像素值。") }
@@ -831,14 +847,22 @@ final class Studio: ObservableObject {
             resolution = upscaleScale
         }
         let editSource = localEditImageID.flatMap { localEditResults[$0]?.image.url == input ? $0 : nil }
+        try upscale(input: input, model: model, family: family, seed: seed, output: output,
+                    resolution: resolution, softness: upscaleSoftness, lowRAM: lowRAM, editSource: editSource)
+    }
+
+    func upscale(input: URL, model: LocalModel, family: Family, seed: String, output: URL,
+                         resolution: String, softness: Double, lowRAM: Bool, editSource: URL? = nil,
+                         completion: InferenceCompletion? = nil) throws {
+        guard fm.isReadableFile(atPath: input.path) else { throw StudioError("请选择需要放大的图片。") }
         run(command: family.command, model: model, output: output, activity: "正在高清放大…",
-            editSource: editSource) { path, _ in
+            editSource: editSource, completion: completion) { path, _ in
             var args = ["--model", path.path, "--image-path", input.path, "--resolution", resolution,
-                        "--softness", String(self.upscaleSoftness), "--seed", seed, "--output", output.path]
+                        "--softness", String(softness), "--seed", seed, "--output", output.path]
             if self.fm.fileExists(atPath: path.appendingPathComponent(family.seedTransformerFile).path) {
                 args += ["--quantize", "4"]
             }
-            if self.lowRAM { args.append("--low-ram") }
+            if lowRAM { args.append("--low-ram") }
             return args
         }
     }
@@ -849,6 +873,15 @@ final class Studio: ObservableObject {
             throw StudioError("请选择一张参考图，并涂出要编辑的区域。")
         }
         let input = references[sourceIndex]
+        let target = try dimensions(repairSize, reference: input, family: family)
+        try repair(model: model, family: family, seed: seed, output: output, input: input,
+                   sourceIndex: sourceIndex, prompt: prompt, target: target, strokes: repairStrokes, settings: inference)
+    }
+
+    func repair(model: LocalModel, family: Family, seed: String, output: URL,
+                        input: ReferenceImage, sourceIndex: Int, prompt: String, target: CGSize,
+                        strokes: [MaskStroke], settings: InferenceOptions,
+                        completion: InferenceCompletion? = nil) throws {
         guard fm.isReadableFile(atPath: input.url.path) else {
             throw StudioError("找不到参考图 \(input.url.lastPathComponent)。")
         }
@@ -859,20 +892,18 @@ final class Studio: ObservableObject {
         }.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !mentionsOtherImage else { throw StudioError("局部编辑只使用当前涂抹的那张参考图，请调整提示词中的图片引用。") }
         guard !text.isEmpty else { throw StudioError("请输入提示词。") }
-        let target = try dimensions(repairSize, reference: input, family: family)
-        let settings = try generationOptions(family, referenced: true, size: target, seed: seed)
+        let options = try generationOptions(family, referenced: true, size: target, seed: seed, settings: settings)
         let fill = family.group == .fill
         let command = fill ? family.command : "mflux-generate-qwen-2.1-edit"
-        let strokes = repairStrokes
         run(command: command, model: model, output: output, activity: "正在局部编辑…", editSource: input.id,
-            finalize: { scratch in try RepairMask.composite(in: scratch, output: output) }) { path, scratch in
+            finalize: { scratch in try RepairMask.composite(in: scratch, output: output) }, completion: completion) { path, scratch in
             try RepairMask.stage(source: input.url, strokes: strokes, size: target, in: scratch)
             let inputPath = scratch.appendingPathComponent("input.png").path
             let maskPath = scratch.appendingPathComponent("mask.png").path
             let rawOutput = scratch.appendingPathComponent("repaired.png").path
             let flags = fill ? ["--image-path", inputPath, "--masked-image-path", maskPath]
                              : ["--image-paths", inputPath, "--mask-image", maskPath]
-            return ["--model", path.path, "--base-model", family.id, "--prompt=\(text)", "--output", rawOutput] + settings + flags
+            return ["--model", path.path, "--base-model", family.id, "--prompt=\(text)", "--output", rawOutput] + options + flags
         }
     }
 
@@ -1133,11 +1164,16 @@ final class Studio: ObservableObject {
     private func run(command: String, model: LocalModel, output: URL?, activity: String,
                      editSource: URL? = nil,
                      finalize: ((URL) throws -> Void)? = nil,
+                     completion: InferenceCompletion? = nil,
                      arguments: (URL, URL) throws -> [String]) {
-        guard !running else { return }
+        guard !running else {
+            completion?(.failure(StudioError("当前已有任务正在运行。")))
+            return
+        }
         let executable = tools.appendingPathComponent(command)
         guard fm.isExecutableFile(atPath: executable.path) else {
-            error = "找不到已安装的命令 \(command)。"
+            let failure = StudioError("找不到已安装的命令 \(command)。")
+            if let completion { completion(.failure(failure)) } else { error = failure.localizedDescription }
             return
         }
         let scratch = fm.temporaryDirectory.appendingPathComponent("mflux-studio-\(UUID())", isDirectory: true)
@@ -1145,7 +1181,7 @@ final class Studio: ObservableObject {
         do {
             try fm.createDirectory(at: scratch, withIntermediateDirectories: false)
             let path = try modelPath(model, in: scratch)
-            if output != nil { try fm.createDirectory(at: images, withIntermediateDirectories: true) }
+            if let output { try fm.createDirectory(at: output.deletingLastPathComponent(), withIntermediateDirectories: true) }
             let logfile = scratch.appendingPathComponent("run.log")
             try Data().write(to: logfile)
             let handle = try FileHandle(forWritingTo: logfile)
@@ -1177,22 +1213,31 @@ final class Studio: ObservableObject {
                     try? self.fm.removeItem(at: scratch)
                     self.running = false
                     self.process = nil
+                    defer { self.frameServer.resumeQueue() }
                     if self.stopped {
                         self.message = "已停止。"
+                        completion?(.failure(FrameAPIError(409, "cancelled", self.message)))
                     } else if task.terminationStatus != 0 {
                         self.message = "运行失败。请查看下方日志。"
+                        completion?(.failure(StudioError(self.message)))
                     } else if let finalizeError {
                         self.message = finalizeError
+                        completion?(.failure(StudioError(finalizeError)))
                     } else if let output {
-                        if self.fm.fileExists(atPath: output.path) {
-                            if let image = ReferenceImage(url: output) {
-                                let result = StudioResult(image: image, elapsed: elapsed)
+                        if let source = CGImageSourceCreateWithURL(output as CFURL, nil),
+                           CGImageSourceGetType(source) == UTType.png.identifier as CFString,
+                           let image = ReferenceImage(url: output) {
+                            let result = StudioResult(image: image, elapsed: elapsed)
+                            if let completion {
+                                completion(.success(result))
+                            } else {
                                 self.outputResult = result
                                 if let editSource { self.localEditResults[editSource] = result }
                             }
                             self.message = "图片已保存。"
                         } else {
-                            self.message = "mflux 已结束，请查看日志中的输出路径。"
+                            self.message = "mflux 未生成可读取的 PNG 图片。"
+                            completion?(.failure(StudioError(self.message)))
                         }
                     } else {
                         self.message = "模型文件检查通过。"
@@ -1212,7 +1257,7 @@ final class Studio: ObservableObject {
             }
         } catch {
             try? fm.removeItem(at: scratch)
-            self.error = error.localizedDescription
+            if let completion { completion(.failure(error)) } else { self.error = error.localizedDescription }
         }
     }
 

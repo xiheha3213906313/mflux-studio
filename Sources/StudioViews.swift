@@ -507,6 +507,7 @@ final class Presentation: ObservableObject {
     @Published var comparingLocalEdit = false
     @Published var editing: LocalModel?
     @Published var componentSource: LocalModel?
+    @Published var framePanel = false
     @Published var pendingTrash: LocalModel?
 }
 
@@ -548,6 +549,7 @@ struct StudioView: View {
             ModelEditor(studio: studio, existing: presentation.editing, source: presentation.componentSource)
         }
         .sheet(isPresented: $presentation.catalog) { CatalogView(studio: studio, initialGroup: presentation.catalogGroup) }
+        .sheet(isPresented: $presentation.framePanel) { FramePanel(server: studio.frameServer) }
         .sheet(item: $presentation.preview) { image in
             VStack(spacing: 12) {
                 HStack {
@@ -763,6 +765,10 @@ struct StudioView: View {
                 }
             }
             Spacer(minLength: 2)
+            Button { presentation.framePanel = true } label: {
+                Label("连接映序", systemImage: "iphone")
+            }
+            .fixedSize()
             Button { studio.open(studio.images) } label: {
                 Label("图片文件夹", systemImage: "folder")
             }
@@ -868,7 +874,7 @@ struct StudioView: View {
                     field("步数") {
                         HStack(spacing: 3) {
                             TextField("步数", value: $studio.steps, format: .number)
-                            Stepper("调整步数", value: $studio.steps, in: 1...150).labelsHidden()
+                            Stepper("调整步数", value: $studio.steps, in: family.minimumSteps...150).labelsHidden()
                         }
                     }
                     seedField
