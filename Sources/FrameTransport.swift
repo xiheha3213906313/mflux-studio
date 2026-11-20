@@ -394,37 +394,25 @@ func frameDigest(_ data: Data) -> String {
 
 struct FramePairing {
     static let lifetime: TimeInterval = 300
-    private static let alphabet = Array("0123456789ABCDEFGHJKMNPQRSTVWXYZ".utf8)
+    static let maxFailures = 5
 
     let code: String
     let expires: Date
+    var failures = 0
 
     init() throws {
-        code = try frameRandomBytes(count: 12).map { byte in
-            Self.alphabet[Int(byte & 31)]
-        }.withUnsafeBufferPointer { String(decoding: $0, as: UTF8.self) }
+        // Discard the incomplete range so each six-digit code is equally likely.
+        var value: UInt32
+        repeat {
+            value = try frameRandomBytes(count: 4).reduce(0) { ($0 << 8) | UInt32($1) }
+        } while value >= 4_294_000_000
+        code = String(format: "%06d", Int(value % 1_000_000))
         expires = Date().addingTimeInterval(Self.lifetime)
     }
 
-    var displayCode: String { "\(code.prefix(4))-\(code.dropFirst(4).prefix(4))-\(code.suffix(4))" }
-
-    static func validHex(_ value: String) -> Bool {
-        value.utf8.count == 64 && value.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) }
-    }
-
-    enum Role: String { case server, client }
-
-    func proof(_ role: Role, nonce: String, identity: FrameTLS) -> String {
-        let input = ["mflux-studio-pair-v1:" + role.rawValue, identity.serverId.uuidString.lowercased(),
-                     identity.fingerprint, nonce].joined(separator: "\n")
-        let mac = HMAC<SHA256>.authenticationCode(for: Data(input.utf8), using: SymmetricKey(data: Data(code.utf8)))
-        return mac.map { String(format: "%02x", $0) }.joined()
-    }
-
-    func authorizes(_ proof: String, nonce: String, identity: FrameTLS) -> Bool {
-        guard Self.validHex(proof) else { return false }
-        let expected = self.proof(.client, nonce: nonce, identity: identity)
-        return zip(expected.utf8, proof.utf8).reduce(UInt8(0)) { $0 | ($1.0 ^ $1.1) } == 0
+    func authorizes(_ submitted: String) -> Bool {
+        guard submitted.utf8.count == 6 else { return false }
+        return zip(code.utf8, submitted.utf8).reduce(UInt8(0)) { $0 | ($1.0 ^ $1.1) } == 0
     }
 }
 

@@ -6,22 +6,13 @@
 
 Mac 用 Bonjour 发布 `_mflux-studio._tcp`，TXT 含 `v=1`、`ipv4` 和 `serverId`。Android 使用 NSD 找到设备，让用户选择 Mac 后输入配对码。发现失败时支持手动填入 Mac 显示的 HTTPS 地址。Bonjour 和手填地址都只提供连接地址，身份要在 TLS 中核验。
 
-### 一次性配对码
+### 六位配对码（MFlux Studio 1.18 起）
 
-从 MFlux Studio 1.17 开始使用配对码。Mac 界面显示 12 位字符，形如 `XXXX-XXXX-XXXX`。输入可忽略连字符、空格和大小写，规范化后必须是 12 个来自 `0123456789ABCDEFGHJKMNPQRSTVWXYZ` 的字符。五分钟内可使用一次。重新生成、停止服务或成功配对会让当前码失效。配对码留在手机本地用于计算证明。
+Mac 界面显示六位数字（可带前导零）和证书指纹的前 16 位十六进制。配对码五分钟内可用一次。输错五次后本次配对立即结束，用户须在 Mac 手动生成新码。
 
-1. 生成 32 字节的客户端随机数，编码为 64 位小写十六进制字符串 `nonce`。在独立、临时的 TLS 1.2+ 连接中记录实际叶证书的 DER SHA-256 指纹。配对前的自签名只用于这条受限连接。发送 `POST /v1/pair/challenge` 和 `{"nonce":"…"}`，获得 `{"version":1,"serverId":"…","proof":"…"}`。这一步只发送随机数。
-2. 用下面的算法计算 `server` 证明并与响应做常量时间比较。指纹必须来自 TLS 握手。校验通过后，把该证书指纹固定给此 Mac。在发送最终配对请求前，后续 TLS 握手继续校验该指纹。
-3. 用同一个 nonce 和 `client` 角色计算另一个证明，发送 `POST /v1/pair` 和 `{"nonce":"…","proof":"…","deviceName":"我的手机"}`。返回 201 和 `{"version":1,"serverId":"…","deviceId":"…","token":"…"}`。校验两次返回的 serverId 一致。保存配对证书指纹、serverId、deviceId 和 endpoint，并加密保存 token。403 `pairing_invalid` 表示证明无效、码已使用或已过期。
-
-证明为 `hexLower(HMAC-SHA256(key=UTF8(规范化后的配对码), message=UTF8(下列四行)))`。行与行之间使用 LF，末尾不加换行。serverId 用小写 UUID，指纹和 nonce 都用小写十六进制。
-
-```text
-mflux-studio-pair-v1:<server 或 client>
-<serverId>
-<实际 TLS 叶证书 DER 的 SHA-256>
-<nonce>
-```
+1. 用独立的配对连接握手并计算实际 HTTPS 叶证书 DER 的 SHA-256。首次配对时，在手机显示指纹前 16 位，让用户与 Mac 界面比对并确认。确认后固定完整指纹，发送配对码前重新验证当前 TLS 连接的完整指纹。已持有该 Mac 指纹时直接使用已保存的完整指纹进行核验。
+2. 向 `POST /v1/pair` 提交 JSON `{"code":"012345","deviceName":"我的手机"}`。code 是字符串，配对码只通过已核验的 HTTPS 连接发送。
+3. 响应 201 返回 `{"version":1,"serverId":"…","deviceId":"…","token":"…"}`。保存完整证书指纹、serverId、deviceId 和 endpoint，并加密保存 token。403 `pairing_invalid` 表示配对码错误、已使用或过期。429 `pairing_locked` 表示当前码已失效，提示用户到 Mac 重新生成且停止本次重试。
 
 已配对的请求发送 `Authorization: Bearer <token>`，并在发送前核验保存的证书指纹。地址变化时可重新发现或手动更新地址，确认同一证书和 serverId 后继续使用原凭证与任务 ID。被撤销的设备收到 401。配对凭证与方舟连接各自管理。
 
@@ -69,5 +60,5 @@ HTTP 使用 1.1、固定 `Content-Length`、无重定向。含 JSON 的 POST 用
 
 - `GET /v1/jobs/{id}` 返回任务对象。`state` 为 `queued`、`running`、`succeeded`、`failed` 或 `cancelled`。响应包含 `id/operation/modelId/modelName/familyId/createdAt/options`。options 含 Mac 采用的尺寸、步数和实际种子等。失败时返回 `error.code/message`。任务在 Mac 运行期间被应用中断，重开服务后报告 `interrupted`。
 - `POST /v1/jobs/{id}/cancel` 为空体。排队任务确认取消时返回 200。运行中返回 202 和 `cancelRequested:true`，以随后查询到的终态为准。已处于终态时返回原状态。
-- 成功响应中的 `output` 提供 `width/height/elapsedSeconds/path/mimeType`。`GET /v1/jobs/{id}/output` 返回原始 PNG 字节，建议直接流式写入应用临时文件，校验完成后再入库。仅接受同一个 HTTPS 端点上的已知相对路径。已完成任务的中转图保留约 7 天，过期或原图缺失时返回 404 `output_unavailable`。本地任务记录仍可查询。
+- 成功响应中的 `output` 提供 `width/height/elapsedSeconds/path/mimeType`。`GET /v1/jobs/{id}/output` 返回原始 PNG 字节，建议直接流式写入应用临时文件，校验完成后再入库。仅接受同一个 HTTPS 端点上的已知相对路径。已完成任务的中转图可下载 7 天。MFlux Studio 1.18 同时在 Mac 的 `Images` 文件夹保存副本。中转图过期或缺失时返回 404 `output_unavailable`。本地任务记录仍可查询。
 - 同一设备凭证只能访问自己的任务。更换 Mac 的 IPv4 地址时保留原来的配对凭证和证书指纹，更新 endpoint 后按原任务 ID 查询。

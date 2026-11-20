@@ -28,29 +28,26 @@ struct FramePanel: View {
                         ))
                         .toggleStyle(.switch)
                     }
-                    Text("开启后，每次打开 MFlux Studio 时会自动启动服务。")
-                        .font(.callout).foregroundStyle(.secondary)
                     if let address = server.address {
-                        LabeledContent("服务地址") {
+                        HStack {
+                            Text("服务地址")
                             Text(address).monospaced().textSelection(.enabled)
+                            Spacer()
+                            Button("生成配对码") { server.newPairing() }
                         }
                         if let code = server.pairingCode, let expires = server.pairExpires {
                             LabeledContent("配对码") {
                                 Text(code)
                                     .font(.system(.title3, design: .monospaced).weight(.semibold))
                                     .textSelection(.enabled)
-                                    .accessibilityLabel(Text("配对码 \(code)"))
                             }
-                            HStack {
-                                Text("在安卓映序选择这台 Mac，输入配对码。")
-                                    .font(.callout).foregroundStyle(.secondary)
-                                Spacer()
-                                Button("重新生成") { server.newPairing() }
+                            if let fingerprint = server.pairingFingerprint {
+                                LabeledContent("证书指纹") {
+                                    Text(fingerprint).monospaced().textSelection(.enabled)
+                                }
                             }
                             Text("此码在 \(expires.formatted(date: .omitted, time: .shortened)) 前可使用一次。")
                                 .font(.caption).foregroundStyle(.secondary)
-                        } else {
-                            Button("生成配对码") { server.newPairing() }
                         }
                     } else if server.starting {
                         ProgressView("正在启动局域网连接…").controlSize(.small)

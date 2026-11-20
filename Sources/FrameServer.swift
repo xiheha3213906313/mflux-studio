@@ -2,6 +2,7 @@ import Combine
 import Foundation
 import ImageIO
 import Network
+import OSLog
 import UniformTypeIdentifiers
 
 struct FrameDevice: Codable, Identifiable {
@@ -43,6 +44,7 @@ struct FrameJob: Codable, Identifiable {
     var message: String?
     var output: Output?
     var finished: Date?
+    var archived: Bool?
 
     var key: String { deviceId.uuidString + "-" + id.uuidString }
 
@@ -68,6 +70,7 @@ final class FrameServer: ObservableObject {
     private let root: URL
     private let files = FileManager.default
     private let preferences: UserDefaults
+    private static let archiveLog = Logger(subsystem: "local.codex.mflux-studio", category: "FrameArchive")
     private static let enabledKey = "FrameStudioConnectionEnabled"
     private static let interfaceKey = "FrameStudioConnectionInterface"
     private var monitor: Timer?
@@ -76,6 +79,7 @@ final class FrameServer: ObservableObject {
     private var identity: FrameTLS?
     private var connections: [UUID: FrameHTTPConnection] = [:]
     private var pairing: FramePairing?
+    private var pairingLocked = false
     private var records: [String: FrameJob] = [:]
     private var activeKey: String?
     private var cancellationPending = false
@@ -85,6 +89,7 @@ final class FrameServer: ObservableObject {
     @Published private(set) var address: String?
     @Published private(set) var starting = false
     @Published private(set) var pairingCode: String?
+    @Published private(set) var pairingFingerprint: String?
     @Published private(set) var pairExpires: Date?
     @Published private(set) var devices: [FrameDevice] = []
     @Published private(set) var jobs: [FrameJob] = []
@@ -143,6 +148,7 @@ final class FrameServer: ObservableObject {
     func start(on interface: FrameAddress, port: NWEndpoint.Port = 42817) {
         guard listener == nil else { return }
         do {
+            error = nil
             try load()
             let identity = try FrameTLS.load(in: root)
             let parameters = try identity.parameters()
@@ -155,7 +161,6 @@ final class FrameServer: ObservableObject {
             self.listener = listener
             boundInterface = interface
             self.identity = identity
-            error = nil
             starting = true
             listener.stateUpdateHandler = { [weak self, weak listener] state in
                 guard let self, let listener, self.listener === listener else { return }
@@ -193,14 +198,17 @@ final class FrameServer: ObservableObject {
         address = nil
         starting = false
         clearPairing()
+        pairingLocked = false
     }
 
     func newPairing() {
-        guard address != nil else { return }
+        guard address != nil, let identity else { return }
         do {
             let session = try FramePairing()
             pairing = session
-            pairingCode = session.displayCode
+            pairingLocked = false
+            pairingCode = session.code
+            pairingFingerprint = String(identity.fingerprint.prefix(16)).uppercased()
             pairExpires = session.expires
             error = nil
             DispatchQueue.main.asyncAfter(deadline: .now() + FramePairing.lifetime) { [weak self] in
@@ -212,6 +220,7 @@ final class FrameServer: ObservableObject {
     private func clearPairing() {
         pairing = nil
         pairingCode = nil
+        pairingFingerprint = nil
         pairExpires = nil
     }
 
@@ -275,6 +284,7 @@ final class FrameServer: ObservableObject {
         default:
             job.state = .cancelled
         }
+        archiveOriginal(&job)
         do { try save(job) }
         catch {
             self.error = "无法保存任务结果，请检查 Mac 的存储空间。"
@@ -315,7 +325,7 @@ final class FrameServer: ObservableObject {
     }
 
     private func allow(_ head: FrameHTTPHead) throws {
-        let pairing = head.method == "POST" && ["/v1/pair/challenge", "/v1/pair"].contains(head.path)
+        let pairing = head.method == "POST" && head.path == "/v1/pair"
         if !pairing { _ = try authenticate(head) }
         let submit = head.method == "POST" && head.path == "/v1/jobs"
         let limit = submit ? 64 * 1024 * 1024 : pairing ? 2048 : 0
@@ -339,7 +349,6 @@ final class FrameServer: ObservableObject {
     }
 
     private func respond(_ head: FrameHTTPHead, body: Data) throws -> FrameHTTPResponse {
-        if head.method == "POST" && head.path == "/v1/pair/challenge" { return try pairingChallenge(body) }
         if head.method == "POST" && head.path == "/v1/pair" { return try pair(body) }
         let device = try authenticate(head)
         if head.method == "GET" && head.path == "/v1/models", let studio, let identity {
@@ -375,28 +384,30 @@ final class FrameServer: ObservableObject {
         }
     }
 
-    private var invalidPairing: FrameAPIError {
-        FrameAPIError(403, "pairing_invalid", "配对码不正确或已过期。")
-    }
-
-    private func pairingChallenge(_ body: Data) throws -> FrameHTTPResponse {
-        struct Challenge: Decodable { let nonce: String }
-        guard let identity, let pairing, pairing.expires > Date(),
-              let request = try? JSONDecoder().decode(Challenge.self, from: body),
-              FramePairing.validHex(request.nonce) else { throw invalidPairing }
-        return .json(["version": 1, "serverId": identity.serverId.uuidString,
-                      "proof": pairing.proof(.server, nonce: request.nonce, identity: identity)])
-    }
-
     private func pair(_ body: Data) throws -> FrameHTTPResponse {
         struct PairingRequest: Decodable {
-            let nonce: String
-            let proof: String
+            let code: String
             let deviceName: String
         }
-        guard let identity, let entry = try? JSONDecoder().decode(PairingRequest.self, from: body),
-              let pairing, pairing.expires > Date(), FramePairing.validHex(entry.nonce),
-              pairing.authorizes(entry.proof, nonce: entry.nonce, identity: identity) else { throw invalidPairing }
+        let locked = FrameAPIError(429, "pairing_locked", "本次配对失败过多，请在 Mac 上重新生成配对码。")
+        if pairingLocked { throw locked }
+        guard let identity, var pairing, pairing.expires > Date() else {
+            throw FrameAPIError(403, "pairing_invalid", "配对码已过期，请在 Mac 上重新生成。")
+        }
+        guard let entry = try? JSONDecoder().decode(PairingRequest.self, from: body) else {
+            throw FrameAPIError(400, "invalid_json", "请提交配对码和设备名称。")
+        }
+        guard pairing.authorizes(entry.code) else {
+            pairing.failures += 1
+            if pairing.failures >= FramePairing.maxFailures {
+                clearPairing()
+                pairingLocked = true
+                error = locked.message
+                throw locked
+            }
+            self.pairing = pairing
+            throw FrameAPIError(403, "pairing_invalid", "配对码不正确。")
+        }
         let name = entry.deviceName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty, name.count <= 60, !name.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
             throw FrameAPIError(422, "device_name", "请填写 1 到 60 字的设备名称。")
@@ -499,6 +510,9 @@ final class FrameServer: ObservableObject {
                 }
                 try frameWrite(job, to: file)
             }
+            let wasArchived = job.archived
+            archiveOriginal(&job)
+            if job.archived != wasArchived { try frameWrite(job, to: file) }
             if !job.state.active { cleanInputs(job) }
             recovered[job.key] = job
         }
@@ -513,6 +527,30 @@ final class FrameServer: ObservableObject {
         updateJobs()
     }
 
+    private func archiveOriginal(_ job: inout FrameJob) {
+        guard job.state == .succeeded, job.archived != true, let images = studio?.images else { return }
+        let source = outputFile(directory(job.key))
+        let destination = images.appendingPathComponent("映序-\(job.key).png")
+        if files.fileExists(atPath: destination.path) {
+            job.archived = true
+            return
+        }
+        guard files.fileExists(atPath: source.path) else { return }
+        let staging = images.appendingPathComponent(".frame-\(UUID().uuidString).part")
+        defer { try? files.removeItem(at: staging) }
+        do {
+            try files.createDirectory(at: images, withIntermediateDirectories: true)
+            try files.copyItem(at: source, to: staging)
+            try files.moveItem(at: staging, to: destination)
+            job.archived = true
+        } catch {
+            let failure = error as NSError
+            let jobId = job.id.uuidString
+            Self.archiveLog.error("job=\(jobId, privacy: .public) archive_failed domain=\(failure.domain, privacy: .public) code=\(failure.code)")
+            self.error = "无法将映序图片保存到图片文件夹。原图仍可在任务中下载。"
+        }
+    }
+
     private func cleanInputs(_ job: FrameJob) {
         let dir = directory(job.key)
         for index in 0..<job.plan.inputCount { try? files.removeItem(at: inputFile(dir, at: index)) }
@@ -522,10 +560,10 @@ final class FrameServer: ObservableObject {
     private func updateJobs() {
         // Keep the task ID record for replay protection after its output expires.
         for job in records.values where job.state == .succeeded {
-            if let finished = job.finished, Date().timeIntervalSince(finished) > 7 * 86400 {
+            if job.archived == true, let finished = job.finished, Date().timeIntervalSince(finished) > 7 * 86400 {
                 try? files.removeItem(at: outputFile(directory(job.key)))
             }
         }
-        jobs = Array(records.values.sorted { $0.created > $1.created }.prefix(30))
+        jobs = Array(records.values.sorted { $0.created > $1.created }.prefix(2))
     }
 }
