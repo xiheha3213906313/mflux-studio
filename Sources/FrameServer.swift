@@ -14,20 +14,10 @@ struct FrameDevice: Codable, Identifiable {
 enum FrameJobState: String, Codable {
     case queued, running, succeeded, failed, cancelled
 
-    var title: String {
-        switch self {
-        case .queued: "排队中"
-        case .running: "推理中"
-        case .succeeded: "已完成"
-        case .failed: "失败"
-        case .cancelled: "已取消"
-        }
-    }
-
     var active: Bool { self == .queued || self == .running }
 }
 
-struct FrameJob: Codable, Identifiable {
+struct FrameJob: Codable {
     struct Output: Codable {
         let width: Int
         let height: Int
@@ -92,7 +82,6 @@ final class FrameServer: ObservableObject {
     @Published private(set) var pairingFingerprint: String?
     @Published private(set) var pairExpires: Date?
     @Published private(set) var devices: [FrameDevice] = []
-    @Published private(set) var jobs: [FrameJob] = []
     @Published private(set) var error: String?
 
     init(studio: Studio, preferences: UserDefaults = .standard) {
@@ -231,12 +220,6 @@ final class FrameServer: ObservableObject {
             devices = remaining
             let active = records.values.filter { $0.deviceId == id && $0.state.active }
             for job in active { try cancel(job) }
-        } catch { self.error = error.localizedDescription }
-    }
-
-    func cancelFromMac(_ job: FrameJob) {
-        do {
-            if let current = records[job.key] { try cancel(current) }
         } catch { self.error = error.localizedDescription }
     }
 
@@ -471,7 +454,7 @@ final class FrameServer: ObservableObject {
             try frameWrite(job, to: temp.appendingPathComponent("job.json"))
             try files.moveItem(at: temp, to: directory(job.key))
             records[job.key] = job
-            updateJobs()
+            pruneExpiredOutputs()
             DispatchQueue.main.async { [weak self] in self?.resumeQueue() }
             return .json(job.json, status: 202)
         } catch let error as FrameAPIError {
@@ -517,14 +500,14 @@ final class FrameServer: ObservableObject {
             recovered[job.key] = job
         }
         records = recovered
-        updateJobs()
+        pruneExpiredOutputs()
         loaded = true
     }
 
     private func save(_ job: FrameJob) throws {
         try frameWrite(job, to: directory(job.key).appendingPathComponent("job.json"))
         records[job.key] = job
-        updateJobs()
+        pruneExpiredOutputs()
     }
 
     private func archiveOriginal(_ job: inout FrameJob) {
@@ -557,13 +540,12 @@ final class FrameServer: ObservableObject {
         if job.state != .succeeded { try? files.removeItem(at: outputFile(dir)) }
     }
 
-    private func updateJobs() {
+    private func pruneExpiredOutputs() {
         // Keep the task ID record for replay protection after its output expires.
         for job in records.values where job.state == .succeeded {
             if job.archived == true, let finished = job.finished, Date().timeIntervalSince(finished) > 7 * 86400 {
                 try? files.removeItem(at: outputFile(directory(job.key)))
             }
         }
-        jobs = Array(records.values.sorted { $0.created > $1.created }.prefix(2))
     }
 }

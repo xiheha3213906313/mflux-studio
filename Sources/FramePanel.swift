@@ -1,8 +1,10 @@
 import AppKit
+import ServiceManagement
 import SwiftUI
 
 struct FramePanel: View {
     @ObservedObject var server: FrameServer
+    @ObservedObject var appSettings: StudioAppSettings
     @Environment(\.dismiss) private var dismiss
     @StateObject private var form = FramePanelForm()
 
@@ -60,6 +62,29 @@ struct FramePanel: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading).padding(6)
             }
+            GroupBox {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Toggle("自动启动", isOn: Binding(
+                            get: { appSettings.launchesAtLogin },
+                            set: { appSettings.setLaunchAtLogin($0) }
+                        ))
+                        .toggleStyle(.switch)
+                        .help("登录 macOS 时启动 MFlux Studio")
+                        Spacer()
+                        Toggle("隐藏 Dock 栏图标", isOn: Binding(
+                            get: { appSettings.hidesDock },
+                            set: { appSettings.setDockHidden($0) }
+                        ))
+                        .toggleStyle(.switch)
+                    }
+                    if appSettings.loginApprovalRequired {
+                        Button("在系统设置中允许自动启动") { SMAppService.openSystemSettingsLoginItems() }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading).padding(6)
+            }
+            if let error = appSettings.error { Text(error).foregroundStyle(.red).textSelection(.enabled) }
             if let error = server.error { Text(error).foregroundStyle(.red).textSelection(.enabled) }
 
             if !server.devices.isEmpty {
@@ -72,34 +97,16 @@ struct FramePanel: View {
                     }
                 }
             }
-            if !server.jobs.isEmpty {
-                Text("近期任务").font(.headline)
-                ScrollView {
-                    VStack(spacing: 7) {
-                        ForEach(server.jobs, id: \.key) { job in
-                            HStack {
-                                VStack(alignment: .leading) {
-                                    Text(job.plan.operation.title + " · " + job.plan.modelName).lineLimit(1)
-                                    if let message = job.message {
-                                        Text(message).font(.caption).foregroundStyle(.secondary)
-                                    }
-                                }
-                                Spacer()
-                                Text(job.state.title).foregroundStyle(.secondary)
-                                if job.state.active {
-                                    Button("取消") { server.cancelFromMac(job) }.buttonStyle(.borderless)
-                                }
-                            }
-                        }
-                    }
-                    .padding(.trailing, 8)
-                }
-                .frame(maxHeight: 170)
-            }
         }
         .padding(20)
         .frame(width: 530)
-        .onAppear { reloadInterfaces() }
+        .onAppear {
+            reloadInterfaces()
+            appSettings.refreshLoginStatus()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            appSettings.refreshLoginStatus()
+        }
         .onChange(of: server.address) { _, _ in reloadInterfaces() }
     }
 
@@ -114,4 +121,88 @@ struct FramePanel: View {
 private final class FramePanelForm: ObservableObject {
     @Published var interfaces: [FrameAddress] = []
     @Published var selection: FrameAddress?
+}
+
+
+@MainActor
+final class StudioAppSettings: ObservableObject {
+    private static let hideDockKey = "MFluxStudioHidesDock"
+    private let preferences = UserDefaults.standard
+    private let login = SMAppService.mainApp
+
+    @Published private(set) var hidesDock = UserDefaults.standard.bool(forKey: hideDockKey)
+    @Published private(set) var loginStatus: SMAppService.Status = .notRegistered
+    @Published private(set) var error: String?
+
+    var launchesAtLogin: Bool { loginStatus == .enabled || loginApprovalRequired }
+    var loginApprovalRequired: Bool { loginStatus == .requiresApproval }
+
+    func refreshLoginStatus() {
+        loginStatus = login.status
+    }
+
+    func setLaunchAtLogin(_ enabled: Bool) {
+        refreshLoginStatus()
+        guard enabled != launchesAtLogin else { return }
+        error = nil
+        do {
+            if enabled { try login.register() }
+            else { try login.unregister() }
+        } catch {
+            refreshLoginStatus()
+            if enabled != launchesAtLogin {
+                self.error = "无法更新自动启动：\(error.localizedDescription)"
+            }
+        }
+        refreshLoginStatus()
+    }
+
+    func restoreDockVisibility() {
+        setDockHidden(hidesDock)
+    }
+
+    func setDockHidden(_ hidden: Bool) {
+        let policy: NSApplication.ActivationPolicy = hidden ? .accessory : .regular
+        if NSApp.activationPolicy() != policy {
+            let window = NSApp.keyWindow ?? NSApp.mainWindow
+            guard NSApp.setActivationPolicy(policy) else {
+                hidesDock = NSApp.activationPolicy() == .accessory
+                error = "无法更改 Dock 栏图标的显示状态。"
+                return
+            }
+            if let window, window.isVisible {
+                NSApp.activate()
+                window.makeKeyAndOrderFront(nil)
+            }
+        }
+        error = nil
+        if hidesDock != hidden { hidesDock = hidden }
+        preferences.set(hidden, forKey: Self.hideDockKey)
+    }
+}
+
+final class StudioAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
+    }
+}
+
+struct StudioStatusMenu: View {
+    @ObservedObject var appSettings: StudioAppSettings
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Button("打开 MFlux Studio") { showStudio() }
+        Button("显示 Dock 栏图标") {
+            appSettings.setDockHidden(false)
+            showStudio()
+        }
+        Divider()
+        Button("退出 MFlux Studio") { NSApp.terminate(nil) }
+    }
+
+    private func showStudio() {
+        openWindow(id: "studio")
+        NSApp.activate()
+    }
 }

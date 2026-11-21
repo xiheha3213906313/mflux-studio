@@ -512,7 +512,8 @@ final class Presentation: ObservableObject {
 }
 
 struct StudioView: View {
-    @StateObject var studio = Studio()
+    @ObservedObject var studio: Studio
+    @ObservedObject var appSettings: StudioAppSettings
     @StateObject private var presentation = Presentation()
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.appearsActive) private var appearsActive
@@ -550,7 +551,9 @@ struct StudioView: View {
             ModelEditor(studio: studio, existing: presentation.editing, source: presentation.componentSource)
         }
         .sheet(isPresented: $presentation.catalog) { CatalogView(studio: studio, initialGroup: presentation.catalogGroup) }
-        .sheet(isPresented: $presentation.framePanel) { FramePanel(server: studio.frameServer) }
+        .sheet(isPresented: $presentation.framePanel) {
+            FramePanel(server: studio.frameServer, appSettings: appSettings)
+        }
         .sheet(item: $presentation.preview) { image in
             VStack(spacing: 12) {
                 HStack {
@@ -777,9 +780,8 @@ struct StudioView: View {
             .disabled(!FileManager.default.fileExists(atPath: studio.images.path))
             if let model {
                 Menu {
-                    Toggle("低内存模式", isOn: $studio.lowRAM)
-                    Divider()
                     Button("检查模型") { studio.validate(model) }
+                    Toggle("低内存模式", isOn: $studio.lowRAM)
                     if studio.isLocalEditing, model.kind != .components, let active = studio.activeModel, active.id != model.id {
                         Button("检查局部编辑模型") { studio.validate(active) }
                     }
@@ -788,6 +790,7 @@ struct StudioView: View {
                 } label: {
                     Label("管理模型", systemImage: "ellipsis.circle")
                 }
+                .menuOrder(.fixed)
                 .fixedSize().disabled(studio.running)
             }
         }
@@ -1483,7 +1486,22 @@ private struct Card: ViewModifier {
 
 @main
 struct MFluxStudioApp: App {
+    @NSApplicationDelegateAdaptor(StudioAppDelegate.self) private var delegate
+    @StateObject private var studio = Studio()
+    @StateObject private var appSettings = StudioAppSettings()
+
     var body: some Scene {
-        Window("MFlux Studio", id: "studio") { StudioView() }.defaultSize(width: 960, height: 670)
+        Window("MFlux Studio", id: "studio") {
+            StudioView(studio: studio, appSettings: appSettings)
+                .onAppear { appSettings.restoreDockVisibility() }
+        }
+        .defaultSize(width: 960, height: 670)
+
+        MenuBarExtra("MFlux Studio", systemImage: "photo.on.rectangle", isInserted: Binding(
+            get: { appSettings.hidesDock },
+            set: { appSettings.setDockHidden($0) }
+        )) {
+            StudioStatusMenu(appSettings: appSettings)
+        }
     }
 }

@@ -32,15 +32,6 @@ enum FrameOperation: String, Codable, CaseIterable {
         case .inpaint, .upscale: 1...1
         }
     }
-
-    var title: String {
-        switch self {
-        case .txt2img: "文生图"
-        case .img2img: "参考图编辑"
-        case .inpaint: "局部编辑"
-        case .upscale: "高清放大"
-        }
-    }
 }
 
 struct FrameOptions: Codable {
