@@ -141,6 +141,7 @@ final class FrameHTTPConnection {
     private var body = Data()
     private var request: FrameHTTPHead?
     private var download: DownloadProgress?
+    private var timeout: DispatchSourceTimer?
 
     init(_ connection: NWConnection, allow: @escaping (FrameHTTPHead) throws -> Void,
          respond: @escaping (FrameHTTPHead, Data) throws -> FrameHTTPResponse, closed: @escaping () -> Void) {
@@ -159,15 +160,19 @@ final class FrameHTTPConnection {
             default: break
             }
         }
+        let timeout = DispatchSource.makeTimerSource(queue: .main)
+        timeout.schedule(deadline: .now() + 120)
+        timeout.setEventHandler { [weak self] in self?.close(reason: "timeout_120s") }
+        self.timeout = timeout
+        timeout.activate()
         connection.start(queue: .main)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 120) { [weak self] in
-            self?.close(reason: "timeout_120s")
-        }
     }
 
     func close(reason: String, error: Error? = nil) {
         guard !socketClosed else { return }
         socketClosed = true
+        timeout?.cancel()
+        timeout = nil
         if let download {
             if !download.finalized { try? download.output.file.close() }
             let nsError = error as NSError?

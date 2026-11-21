@@ -547,10 +547,8 @@ struct StudioView: View {
         .frame(minWidth: 790, minHeight: 600)
         .tint(Color(nsColor: studioAccent))
         .environment(\.locale, Locale(identifier: "zh_CN"))
-        .task {
-            appSettings.prepareWindow(openWindow)
-            studio.frameServer.restorePreference()
-        }
+        .background(StudioWindowRegistration(appSettings: appSettings, openWindow: openWindow))
+        .task { studio.frameServer.restorePreference() }
         .sheet(isPresented: $presentation.modelSheet) {
             ModelEditor(studio: studio, existing: presentation.editing, source: presentation.componentSource)
         }

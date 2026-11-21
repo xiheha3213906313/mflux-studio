@@ -124,12 +124,43 @@ private final class FramePanelForm: ObservableObject {
 }
 
 
+struct StudioWindowRegistration: NSViewRepresentable {
+    let appSettings: StudioAppSettings
+    let openWindow: OpenWindowAction
+
+    func makeNSView(context: Context) -> WindowObserver {
+        let view = WindowObserver()
+        view.onAttach = { [weak appSettings] window in
+            appSettings?.prepareWindow(window, openWindow: openWindow)
+        }
+        return view
+    }
+
+    func updateNSView(_ view: WindowObserver, context: Context) {}
+
+    final class WindowObserver: NSView {
+        var onAttach: ((NSWindow) -> Void)?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard let window else { return }
+            // Let SwiftUI finish attaching the window before changing activation policy.
+            DispatchQueue.main.async { [weak self, weak window] in
+                guard let self, let window, self.window === window else { return }
+                self.onAttach?(window)
+            }
+        }
+    }
+}
+
 @MainActor
 final class StudioAppSettings: NSObject, ObservableObject {
     private static let hideDockKey = "MFluxStudioHidesDock"
     private let preferences = UserDefaults.standard
     private var login: SMAppService { .mainApp }
     private var statusItem: NSStatusItem?
+    private weak var dockMenuItem: NSMenuItem?
+    private weak var studioWindow: NSWindow?
     private var openWindow: OpenWindowAction?
 
     @Published private(set) var hidesDock = UserDefaults.standard.bool(forKey: hideDockKey)
@@ -159,37 +190,42 @@ final class StudioAppSettings: NSObject, ObservableObject {
         refreshLoginStatus()
     }
 
-    func prepareWindow(_ openWindow: OpenWindowAction) {
+    func prepareWindow(_ window: NSWindow, openWindow: OpenWindowAction) {
+        studioWindow = window
         self.openWindow = openWindow
         setDockHidden(hidesDock)
     }
 
     func setDockHidden(_ hidden: Bool) {
-        let needsStatusItem = hidden && statusItem == nil
-        if needsStatusItem && !installStatusItem() {
+        if statusItem == nil && !installStatusItem() {
             if hidesDock { hidesDock = false }
             error = "无法添加状态栏图标。"
             return
         }
-
         let policy: NSApplication.ActivationPolicy = hidden ? .accessory : .regular
         if NSApp.activationPolicy() != policy {
-            let window = NSApp.keyWindow ?? NSApp.mainWindow
+            // The connection sheet can be the key window. Preserve its parent studio window.
+            let visible = studioWindow.flatMap { $0.isVisible || $0.attachedSheet?.isVisible == true ? $0 : nil }
             guard NSApp.setActivationPolicy(policy) else {
-                if needsStatusItem { removeStatusItem() }
                 let current = NSApp.activationPolicy() == .accessory
                 if hidesDock != current { hidesDock = current }
                 error = "无法更改 Dock 栏图标的显示状态。"
                 return
             }
-            if let window, window.isVisible {
-                NSApp.activate()
-                window.makeKeyAndOrderFront(nil)
+            if let visible {
+                DispatchQueue.main.async { [weak self, weak visible] in
+                    guard let self, self.hidesDock == hidden else { return }
+                    if let visible, self.studioWindow === visible {
+                        self.bringForward(visible)
+                    } else {
+                        self.showStudio()
+                    }
+                }
             }
         }
-        if !hidden { removeStatusItem() }
         if error != nil { error = nil }
         if hidesDock != hidden { hidesDock = hidden }
+        dockMenuItem?.title = hidden ? "显示 Dock 栏图标" : "隐藏 Dock 栏图标"
         if preferences.bool(forKey: Self.hideDockKey) != hidden {
             preferences.set(hidden, forKey: Self.hideDockKey)
         }
@@ -208,9 +244,12 @@ final class StudioAppSettings: NSObject, ObservableObject {
             button.title = "M"
         }
         button.toolTip = "MFlux Studio"
+        button.setAccessibilityLabel("MFlux Studio")
+        item.autosaveName = "MFluxStudio"
+        item.isVisible = true
         let menu = NSMenu()
         let open = menu.addItem(withTitle: "打开 MFlux Studio", action: #selector(showStudio), keyEquivalent: "")
-        let dock = menu.addItem(withTitle: "显示 Dock 栏图标", action: #selector(showDock), keyEquivalent: "")
+        let dock = menu.addItem(withTitle: "隐藏 Dock 栏图标", action: #selector(toggleDock), keyEquivalent: "")
         menu.addItem(.separator())
         let quit = menu.addItem(withTitle: "退出 MFlux Studio", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "")
         open.target = self
@@ -218,22 +257,29 @@ final class StudioAppSettings: NSObject, ObservableObject {
         quit.target = NSApp
         item.menu = menu
         statusItem = item
+        dockMenuItem = dock
         return true
     }
 
-    private func removeStatusItem() {
-        if let statusItem { NSStatusBar.system.removeStatusItem(statusItem) }
-        statusItem = nil
+    private func bringForward(_ window: NSWindow) {
+        if NSApp.isHidden { NSApp.unhide(nil) }
+        NSApp.activate()
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        window.makeKeyAndOrderFront(nil)
+        window.attachedSheet?.makeKey()
     }
 
     @objc private func showStudio() {
-        openWindow?(id: "studio")
-        NSApp.activate()
+        if let window = studioWindow, window.isVisible {
+            bringForward(window)
+        } else {
+            openWindow?(id: "studio")
+            NSApp.activate()
+        }
     }
 
-    @objc private func showDock() {
-        setDockHidden(false)
-        showStudio()
+    @objc private func toggleDock() {
+        setDockHidden(!hidesDock)
     }
 }
 

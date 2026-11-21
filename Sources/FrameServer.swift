@@ -3,6 +3,7 @@ import Foundation
 import ImageIO
 import Network
 import OSLog
+import SystemConfiguration
 import UniformTypeIdentifiers
 
 struct FrameDevice: Codable, Identifiable {
@@ -63,7 +64,10 @@ final class FrameServer: ObservableObject {
     private static let archiveLog = Logger(subsystem: "local.codex.mflux-studio", category: "FrameArchive")
     private static let enabledKey = "FrameStudioConnectionEnabled"
     private static let interfaceKey = "FrameStudioConnectionInterface"
-    private var monitor: Timer?
+    private var networkStore: SCDynamicStore?
+    private var pathMonitor: NWPathMonitor?
+    private var listenerRetry: DispatchWorkItem?
+    private var retriedListener = false
     private var listener: NWListener?
     private var boundInterface: FrameAddress?
     private var identity: FrameTLS?
@@ -92,18 +96,61 @@ final class FrameServer: ObservableObject {
     }
 
     deinit {
-        monitor?.invalidate()
+        stopMonitoringNetwork()
         listener?.cancel()
     }
 
     var preferredInterface: String? { preferences.string(forKey: Self.interfaceKey) }
 
     func restorePreference() {
-        guard enabled, monitor == nil else { return }
-        refreshInterface()
-        monitor = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            self?.refreshInterface()
+        guard enabled, networkStore == nil, pathMonitor == nil else { return }
+        var context = SCDynamicStoreContext(version: 0, info: Unmanaged.passUnretained(self).toOpaque(),
+                                            retain: nil, release: nil, copyDescription: nil)
+        let store = SCDynamicStoreCreate(nil, "MFlux Studio LAN" as CFString, { _, _, info in
+            guard let info else { return }
+            Unmanaged<FrameServer>.fromOpaque(info).takeUnretainedValue().networkDidChange()
+        }, &context)
+        if let store, SCDynamicStoreSetNotificationKeys(store, ["State:/Network/Global/IPv4"] as CFArray,
+                                                        ["State:/Network/Interface/[^/]+/IPv4"] as CFArray),
+           SCDynamicStoreSetDispatchQueue(store, .main) {
+            networkStore = store
+        } else {
+            let monitor = NWPathMonitor()
+            monitor.pathUpdateHandler = { [weak self] _ in self?.networkDidChange() }
+            pathMonitor = monitor
+            monitor.start(queue: .main)
         }
+        refreshInterface()
+    }
+
+    private func stopMonitoringNetwork() {
+        if let networkStore { SCDynamicStoreSetDispatchQueue(networkStore, nil) }
+        networkStore = nil
+        pathMonitor?.cancel()
+        pathMonitor = nil
+        listenerRetry?.cancel()
+        listenerRetry = nil
+        retriedListener = false
+    }
+
+    private func networkDidChange() {
+        guard enabled else { return }
+        listenerRetry?.cancel()
+        listenerRetry = nil
+        retriedListener = false
+        refreshInterface()
+    }
+
+    private func retryListenerOnce() {
+        guard enabled, !retriedListener else { return }
+        retriedListener = true
+        let retry = DispatchWorkItem { [weak self] in
+            guard let self, self.enabled else { return }
+            self.listenerRetry = nil
+            self.refreshInterface()
+        }
+        listenerRetry = retry
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: retry)
     }
 
     func setEnabled(_ value: Bool, interface: FrameAddress?) {
@@ -116,8 +163,7 @@ final class FrameServer: ObservableObject {
         if value {
             restorePreference()
         } else {
-            monitor?.invalidate()
-            monitor = nil
+            stopMonitoringNetwork()
             stop()
             error = nil
         }
@@ -157,10 +203,12 @@ final class FrameServer: ObservableObject {
                 case .ready:
                     if let port = listener.port { self.address = "https://\(interface.id):\(port.rawValue)" }
                     self.starting = false
+                    self.retriedListener = false
                     self.resumeQueue()
                 case .failed(let error), .waiting(let error):
                     self.stop()
                     self.error = "局域网服务启动失败：\(error.localizedDescription)"
+                    self.retryListenerOnce()
                 default: break
                 }
             }
@@ -174,6 +222,7 @@ final class FrameServer: ObservableObject {
             listener.start(queue: .main)
         } catch {
             self.error = error.localizedDescription
+            retryListenerOnce()
         }
     }
 
