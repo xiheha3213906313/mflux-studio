@@ -517,6 +517,7 @@ struct StudioView: View {
     @StateObject private var presentation = Presentation()
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.appearsActive) private var appearsActive
+    @Environment(\.openWindow) private var openWindow
     private let workspacePadding: CGFloat = 22
     private let workspaceMaxWidth: CGFloat = 980
     private let footerHeight: CGFloat = 62
@@ -546,7 +547,10 @@ struct StudioView: View {
         .frame(minWidth: 790, minHeight: 600)
         .tint(Color(nsColor: studioAccent))
         .environment(\.locale, Locale(identifier: "zh_CN"))
-        .onAppear { studio.frameServer.restorePreference() }
+        .task {
+            appSettings.prepareWindow(openWindow)
+            studio.frameServer.restorePreference()
+        }
         .sheet(isPresented: $presentation.modelSheet) {
             ModelEditor(studio: studio, existing: presentation.editing, source: presentation.componentSource)
         }
@@ -1493,15 +1497,7 @@ struct MFluxStudioApp: App {
     var body: some Scene {
         Window("MFlux Studio", id: "studio") {
             StudioView(studio: studio, appSettings: appSettings)
-                .onAppear { appSettings.restoreDockVisibility() }
         }
         .defaultSize(width: 960, height: 670)
-
-        MenuBarExtra("MFlux Studio", systemImage: "photo.on.rectangle", isInserted: Binding(
-            get: { appSettings.hidesDock },
-            set: { appSettings.setDockHidden($0) }
-        )) {
-            StudioStatusMenu(appSettings: appSettings)
-        }
     }
 }
